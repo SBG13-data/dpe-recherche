@@ -1,7 +1,7 @@
 {
   "name": "dpe-recherche",
   "version": "1.0.0",
-  "description": "Recherche DPE par adresse - données ADEME",
+  "description": "Outil DPE ADEME avec Google Maps",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
