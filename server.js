@@ -6,11 +6,11 @@ const PORT = process.env.PORT || 3000;
 function fetchUrl(targetUrl) {
   return new Promise((resolve, reject) => {
     https.get(targetUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 DPE-App/1.0', 'Accept': 'application/json', 'Referer': 'https://data.ademe.fr/' }
+      headers: { 'User-Agent': 'Mozilla/5.0 DPE-App/1.0', 'Accept': '*/*', 'Referer': 'https://data.ademe.fr/' }
     }, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks), headers: res.headers }));
     }).on('error', reject);
   });
 }
@@ -28,9 +28,26 @@ const server = http.createServer(async (req, res) => {
   if (path === '/' || path === '/index.html') { sendHTML(res, HTML_SEARCH); return; }
   if (path === '/extract') { sendHTML(res, HTML_EXTRACT); return; }
 
+  // ── Proxy tuiles OSM (évite le CORS navigateur) ─────────────────
+  if (path === '/tile') {
+    const z = u.searchParams.get('z'), x = u.searchParams.get('x'), y = u.searchParams.get('y');
+    if (!z || !x || !y) { res.writeHead(400); res.end(); return; }
+    try {
+      const sub = ['a','b','c'][(parseInt(x)+parseInt(y))%3];
+      const r = await fetchUrl('https://'+sub+'.tile.openstreetmap.org/'+z+'/'+x+'/'+y+'.png');
+      res.writeHead(r.status, {
+        'Content-Type': r.headers['content-type'] || 'image/png',
+        'Cache-Control': 'public, max-age=86400',
+        'Access-Control-Allow-Origin': '*'
+      });
+      res.end(r.body);
+    } catch(e) { res.writeHead(500); res.end(); }
+    return;
+  }
+
   if (path === '/ban') {
     const q = u.searchParams.get('q') || '';
-    try { const r = await fetchUrl('https://api-adresse.data.gouv.fr/search/?q=' + encodeURIComponent(q) + '&limit=6'); sendJSON(res, r.body); }
+    try { const r = await fetchUrl('https://api-adresse.data.gouv.fr/search/?q=' + encodeURIComponent(q) + '&limit=6'); sendJSON(res, r.body.toString()); }
     catch (e) { sendError(res, e.message); }
     return;
   }
@@ -42,11 +59,11 @@ const server = http.createServer(async (req, res) => {
       const r = await fetchUrl('https://data.ademe.fr/data-fair/api/v1/datasets/dpe03existant/lines?q=' + encodeURIComponent(q) + '&q_fields=adresse_ban&page=1&size=8&sort=-date_etablissement_dpe&select=' + fields);
       if (r.status === 200) {
         try {
-          const d = JSON.parse(r.body);
+          const d = JSON.parse(r.body.toString());
           if (d.results) d.results = d.results.map(row => ({ ...row, consommation_energie: row.conso_5_usages_e_finale, emission_ges: row.emission_ges_5_usages }));
           sendJSON(res, d);
-        } catch { sendJSON(res, r.body); }
-      } else { sendJSON(res, JSON.stringify({ results: [], _debug: r.body.substring(0, 300) })); }
+        } catch { sendJSON(res, r.body.toString()); }
+      } else { sendJSON(res, JSON.stringify({ results: [], _debug: r.body.toString().substring(0, 300) })); }
     } catch (e) { sendError(res, e.message); }
     return;
   }
@@ -56,21 +73,15 @@ const server = http.createServer(async (req, res) => {
     const classes = u.searchParams.get('classes') || 'A,B,C,D,E,F,G';
     const page    = parseInt(u.searchParams.get('page') || '1');
     if (!bbox) { sendError(res, 'bbox requis'); return; }
-
-    // Dataset récent dpe03existant — filtre etiquette_dpe_in
     const apiUrl = 'https://data.ademe.fr/data-fair/api/v1/datasets/dpe03existant/lines?' +
       'bbox=' + encodeURIComponent(bbox) +
       '&etiquette_dpe_in=' + encodeURIComponent(classes) +
       '&page=' + page + '&size=500&sort=-date_etablissement_dpe' +
       '&select=adresse_ban,etiquette_dpe,etiquette_ges,conso_5_usages_e_finale,emission_ges_5_usages,annee_construction,longitude_ban,latitude_ban,date_etablissement_dpe,numero_dpe,type_batiment,type_energie_principale_chauffage,type_installation_chauffage';
-
     try {
       const r = await fetchUrl(apiUrl);
-      if (r.status === 200) {
-        sendJSON(res, r.body);
-      } else {
-        sendJSON(res, JSON.stringify({ results: [], total: 0, _debug: 'HTTP ' + r.status + ': ' + r.body.substring(0, 300) }));
-      }
+      if (r.status === 200) { sendJSON(res, r.body.toString()); }
+      else { sendJSON(res, JSON.stringify({ results: [], total: 0, _debug: 'HTTP ' + r.status + ': ' + r.body.toString().substring(0, 300) })); }
     } catch (e) { sendError(res, e.message); }
     return;
   }
@@ -104,37 +115,33 @@ const HTML_SEARCH = `<!DOCTYPE html>
     input[type=text]{flex:1;padding:.75rem 1rem;border:1.5px solid #e0e0e0;border-radius:10px;font-size:1rem;outline:none;background:#fafafa}
     input[type=text]:focus{border-color:#4361ee;background:white}
     .btn{padding:.75rem 1.4rem;background:#4361ee;color:white;border:none;border-radius:10px;font-size:.95rem;font-weight:600;cursor:pointer;white-space:nowrap}
-    .btn:hover{background:#3451d1}
-    .btn:disabled{background:#aab4e8;cursor:not-allowed}
+    .btn:hover{background:#3451d1} .btn:disabled{background:#aab4e8;cursor:not-allowed}
     #suggestions{position:absolute;left:1.5rem;right:1.5rem;top:calc(100% - .5rem);background:white;border:1.5px solid #e0e0e0;border-radius:10px;z-index:100;overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,.12);display:none}
     .sug{padding:11px 16px;font-size:.9rem;cursor:pointer;border-bottom:1px solid #f0f0f0}
     .sug:hover{background:#f0f4ff;color:#4361ee}
     #status{margin-top:1rem;padding:.75rem 1rem;border-radius:10px;font-size:.9rem;display:none}
-    .s-load{background:#f0f4ff;color:#4361ee;display:flex!important;align-items:center;gap:8px}
-    .s-err{background:#fff0f0;color:#c0392b;display:block!important}
+    .sl{background:#f0f4ff;color:#4361ee;display:flex!important;align-items:center;gap:8px}
+    .se{background:#fff0f0;color:#c0392b;display:block!important}
     .spin{width:16px;height:16px;border:2px solid #b8c6ff;border-top-color:#4361ee;border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
     @keyframes spin{to{transform:rotate(360deg)}}
     #multi{background:white;border-radius:16px;padding:1.5rem;box-shadow:0 2px 12px rgba(0,0,0,.07);margin-bottom:1.5rem;display:none}
-    .mitem{display:flex;align-items:center;gap:12px;padding:12px 14px;border:1.5px solid #e8e8e8;border-radius:10px;cursor:pointer;margin-bottom:8px}
-    .mitem:hover{border-color:#4361ee;background:#f0f4ff}
+    .mi{display:flex;align-items:center;gap:12px;padding:12px 14px;border:1.5px solid #e8e8e8;border-radius:10px;cursor:pointer;margin-bottom:8px}
+    .mi:hover{border-color:#4361ee;background:#f0f4ff}
     #result{display:none}
     .rh{background:white;border-radius:16px;padding:1.5rem;box-shadow:0 2px 12px rgba(0,0,0,.07);margin-bottom:1.2rem;display:flex;align-items:center;gap:16px}
     .badge{width:64px;height:64px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:2rem;font-weight:800;flex-shrink:0}
     .A{background:#b7e4c7;color:#1b4332}.B{background:#d8f3dc;color:#1b4332}.C{background:#d9ed92;color:#386641}.D{background:#fff3b0;color:#7b5e00}.E{background:#ffd6a5;color:#7a3500}.F{background:#ffb3b3;color:#7a0000}.G{background:#ff6b6b;color:#4a0000}.N{background:#e8e8e8;color:#666}
-    .rhi h2{font-size:1.1rem;font-weight:600;margin-bottom:4px}
-    .rhi p{font-size:.85rem;color:#888}
+    .rhi h2{font-size:1.1rem;font-weight:600;margin-bottom:4px} .rhi p{font-size:.85rem;color:#888}
     .st{font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#999;margin-bottom:.75rem}
     .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:10px;margin-bottom:1.2rem}
     .ic{background:white;border-radius:12px;padding:1rem;box-shadow:0 2px 8px rgba(0,0,0,.06)}
-    .ic .l{font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:#aaa;margin-bottom:5px}
+    .ic .l{font-size:.7rem;font-weight:600;text-transform:uppercase;color:#aaa;margin-bottom:5px}
     .ic .v{font-size:1rem;font-weight:700;color:#1a1a2e}
-    .egrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:10px;margin-bottom:1.2rem}
+    .eg{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:10px;margin-bottom:1.2rem}
     .ec{background:white;border-radius:12px;padding:1rem;box-shadow:0 2px 8px rgba(0,0,0,.06);border-left:4px solid #4361ee}
-    .ec .l{font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:#aaa;margin-bottom:5px}
+    .ec .l{font-size:.7rem;font-weight:600;text-transform:uppercase;color:#aaa;margin-bottom:5px}
     .ec .v{font-size:.9rem;font-weight:600;color:#1a1a2e;line-height:1.4}
-    .scale{display:flex;gap:4px;margin-top:8px}
-    .si{flex:1;height:6px;border-radius:3px;opacity:.25}
-    .si.on{opacity:1}
+    .sc{display:flex;gap:4px;margin-top:8px} .si{flex:1;height:6px;border-radius:3px;opacity:.25} .si.on{opacity:1}
     .nodpe{background:white;border-radius:16px;padding:2rem;text-align:center;box-shadow:0 2px 12px rgba(0,0,0,.07);display:none}
     .src{text-align:center;font-size:.78rem;color:#bbb;margin-top:1.5rem;padding-top:1rem;border-top:1px solid #eee}
   </style>
@@ -151,12 +158,12 @@ const HTML_SEARCH = `<!DOCTYPE html>
     <div id="suggestions"></div>
     <div id="status"></div>
   </div>
-  <div id="multi"><h3 style="font-size:1rem;color:#555;margin-bottom:1rem">Plusieurs DPE trouvés :</h3><div id="ml"></div></div>
+  <div id="multi"><h3 style="font-size:1rem;color:#555;margin-bottom:1rem">Plusieurs DPE — choisissez :</h3><div id="ml"></div></div>
   <div class="nodpe" id="nodpe"><p>❌ Aucun DPE trouvé pour cette adresse.</p></div>
   <div id="result">
-    <div class="rh"><div id="db" class="badge N">?</div><div class="rhi"><h2 id="ad"></h2><p id="dm"></p><div class="scale" id="sc"></div></div></div>
+    <div class="rh"><div id="db" class="badge N">?</div><div class="rhi"><h2 id="ad"></h2><p id="dm"></p><div class="sc" id="sc"></div></div></div>
     <p class="st">⚡ Performance</p><div class="grid" id="pg"></div>
-    <p class="st">🔧 Équipements</p><div class="egrid" id="eg"></div>
+    <p class="st">🔧 Équipements</p><div class="eg" id="eg"></div>
     <p class="st">🏗️ Logement</p><div class="grid" id="lg"></div>
     <div class="src">Données ADEME · Licence Ouverte Etalab</div>
   </div>
@@ -169,10 +176,10 @@ ai.addEventListener('keydown',e=>{if(e.key==='Enter')go();if(e.key==='Escape')sg
 document.addEventListener('click',e=>{if(!e.target.closest('.card'))sg.style.display='none';});
 async function fs(q){try{const r=await fetch('/ban?q='+encodeURIComponent(q));const d=await r.json();if(!d.features?.length){sg.style.display='none';return;}sg.innerHTML=d.features.map(f=>'<div class="sug" onclick="pk(\''+f.properties.label.replace(/'/g,"\\'")+'\')">'+f.properties.label+'</div>').join('');sg.style.display='block';}catch{sg.style.display='none';}}
 function pk(l){ai.value=l;sg.style.display='none';go();}
-function ss(m,t){const e=document.getElementById('status');if(!m){e.style.display='none';return;}e.innerHTML=t==='l'?'<span class="spin"></span>'+m:m;e.className=t==='l'?'s-load':'s-err';e.style.display=t==='l'?'flex':'block';}
+function ss(m,t){const e=document.getElementById('status');if(!m){e.style.display='none';return;}e.innerHTML=t==='l'?'<span class="spin"></span>'+m:m;e.className=t==='l'?'sl':'se';e.style.display=t==='l'?'flex':'block';}
 function ha(){['result','multi','nodpe'].forEach(i=>document.getElementById(i).style.display='none');ss('','');}
 async function go(){const a=ai.value.trim();if(!a)return;sg.style.display='none';ha();document.getElementById('sb').disabled=true;ss('Interrogation ADEME...','l');try{const r=await fetch('/dpe?q='+encodeURIComponent(a));const d=await r.json();ss('','');document.getElementById('sb').disabled=false;if(d.error)throw new Error(d.error);if(!d.results?.length){document.getElementById('nodpe').style.display='block';return;}d.results.length===1?rd(d.results[0]):sm(d.results);}catch(e){ss('Erreur : '+e.message,'e');document.getElementById('sb').disabled=false;}}
-function sm(R){window._r=R;document.getElementById('ml').innerHTML=R.map((r,i)=>{const cl=r.etiquette_dpe||'N';const dt=(r.date_etablissement_dpe||'').substring(0,10);const sf=r.surface_habitable_logement?Math.round(r.surface_habitable_logement)+'m²':'';return '<div class="mitem" onclick="rd(window._r['+i+'])"><span class="badge '+cl+'" style="width:40px;height:40px;font-size:1.2rem;">'+cl+'</span><div><b style="font-size:.9rem">'+(r.adresse_ban||'')+'</b><br><span style="font-size:.8rem;color:#888">'+(dt?'DPE du '+dt:'')+(sf?' · '+sf:'')+'</span></div></div>';}).join('');document.getElementById('multi').style.display='block';}
+function sm(R){window._r=R;document.getElementById('ml').innerHTML=R.map((r,i)=>{const cl=r.etiquette_dpe||'N';const dt=(r.date_etablissement_dpe||'').substring(0,10);const sf=r.surface_habitable_logement?Math.round(r.surface_habitable_logement)+'m²':'';return '<div class="mi" onclick="rd(window._r['+i+'])"><span class="badge '+cl+'" style="width:40px;height:40px;font-size:1.2rem;">'+cl+'</span><div><b style="font-size:.9rem">'+(r.adresse_ban||'')+'</b><br><span style="font-size:.8rem;color:#888">'+(dt?'DPE du '+dt:'')+(sf?' · '+sf:'')+'</span></div></div>';}).join('');document.getElementById('multi').style.display='block';}
 function rd(r){document.getElementById('multi').style.display='none';const cl=r.etiquette_dpe||'N';const b=document.getElementById('db');b.textContent=cl==='N'?'?':cl;b.className='badge '+cl;document.getElementById('ad').textContent=r.adresse_ban||ai.value;const dt=(r.date_etablissement_dpe||'').substring(0,10);document.getElementById('dm').textContent=(dt?'DPE établi le '+dt:'')+(r.numero_dpe?' · N°'+r.numero_dpe:'');document.getElementById('sc').innerHTML=['A','B','C','D','E','F','G'].map(c=>'<div class="si '+(c===cl?'on':'')+'" style="background:'+(CC[c]||'#ccc')+'"></div>').join('');const cn=r.consommation_energie||r.conso_5_usages_e_finale,gs=r.emission_ges||r.emission_ges_5_usages;
 document.getElementById('pg').innerHTML=[{l:'Classe énergie',v:cl!=='N'?cl:'N/A'},{l:'Classe GES',v:r.etiquette_ges||'N/A'},{l:'Consommation',v:cn?Math.round(cn)+' kWh/m²/an':'N/A'},{l:'Émissions CO₂',v:gs?Math.round(gs)+' kg/m²/an':'N/A'}].map(c=>'<div class="ic"><div class="l">'+c.l+'</div><div class="v">'+c.v+'</div></div>').join('');
 document.getElementById('eg').innerHTML=[{l:'Chauffage',v:r.type_installation_chauffage||'N/A'},{l:'Énergie chauffage',v:r.type_energie_principale_chauffage||'N/A'},{l:'Eau chaude',v:r.type_installation_ecs||'N/A'},{l:'Énergie ECS',v:r.type_energie_principale_ecs||'N/A'},{l:'Ventilation',v:r.type_ventilation||'N/A'}].map(e=>'<div class="ec"><div class="l">'+e.l+'</div><div class="v">'+e.v+'</div></div>').join('');
@@ -182,7 +189,7 @@ document.getElementById('result').style.display='block';window.scrollTo({top:0,b
 </body></html>`;
 
 // ════════════════════════════════════════════════════════════════════
-// PAGE 2 — CARTE & EXTRACTION (TOUS LES DPE)
+// PAGE 2 — CARTE LEAFLET via proxy tuiles
 // ════════════════════════════════════════════════════════════════════
 const HTML_EXTRACT = `<!DOCTYPE html>
 <html lang="fr">
@@ -191,73 +198,61 @@ const HTML_EXTRACT = `<!DOCTYPE html>
   <title>Carte DPE</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    html,body{height:100%;overflow:hidden}
-    body{font-family:'Segoe UI',system-ui,sans-serif;background:#1a1a2e;color:#fff;display:flex;flex-direction:column}
+    html,body{height:100%;overflow:hidden;font-family:'Segoe UI',system-ui,sans-serif}
+    body{display:flex;flex-direction:column;background:#f4f5f7}
 
-    /* ── TOPBAR ── */
-    .bar{background:#1e2a4a;padding:.75rem 1rem;display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;z-index:500;border-bottom:1px solid #2d3a5e}
-    .bar h1{font-size:1rem;font-weight:700;white-space:nowrap;color:#fff}
-    .navl{padding:.4rem .9rem;border-radius:7px;font-size:.82rem;font-weight:600;text-decoration:none;background:#2d3a5e;color:#90b4ff;border:1px solid #3d4f7e}
+    .bar{background:#1e2a4a;padding:.65rem 1rem;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;z-index:1000;border-bottom:1px solid #2d3a5e;flex-shrink:0}
+    .bar h1{font-size:.95rem;font-weight:700;color:#fff;white-space:nowrap}
+    .navl{padding:.35rem .8rem;border-radius:7px;font-size:.8rem;font-weight:600;text-decoration:none;background:#2d3a5e;color:#90b4ff;border:1px solid #3d4f7e;white-space:nowrap}
     .navl:hover{background:#3d4f7e;color:#fff}
 
-    /* Recherche */
-    .swrap{position:relative;flex:1;min-width:160px;max-width:320px}
-    #zi{width:100%;padding:.45rem .85rem;border:1px solid #3d4f7e;border-radius:7px;font-size:.85rem;outline:none;background:#2d3a5e;color:#fff}
+    .swrap{position:relative;flex:1;min-width:140px;max-width:280px}
+    #zi{width:100%;padding:.4rem .8rem;border:1px solid #3d4f7e;border-radius:7px;font-size:.83rem;outline:none;background:#2d3a5e;color:#fff}
     #zi::placeholder{color:#8899bb}
     #zi:focus{border-color:#4361ee}
-    #zs{position:absolute;top:100%;left:0;right:0;background:#1e2a4a;border:1px solid #3d4f7e;border-radius:7px;z-index:2000;overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,.4);display:none;margin-top:2px}
-    .zsi{padding:8px 13px;font-size:.82rem;cursor:pointer;border-bottom:1px solid #2d3a5e;color:#cdd8f0}
+    #zs{position:absolute;top:100%;left:0;right:0;background:#1e2a4a;border:1px solid #3d4f7e;border-radius:7px;z-index:3000;overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,.4);display:none;margin-top:2px}
+    .zsi{padding:8px 12px;font-size:.8rem;cursor:pointer;border-bottom:1px solid #2d3a5e;color:#cdd8f0}
     .zsi:hover{background:#2d3a5e;color:#fff}
 
-    /* Filtres DPE */
-    .filters{display:flex;gap:4px}
-    .fb{padding:.35rem .65rem;border-radius:6px;font-size:.8rem;font-weight:700;cursor:pointer;border:2px solid transparent;transition:all .15s;opacity:1}
-    .fb.off{opacity:.3}
-    .fA{background:#b7e4c7;color:#1b4332;border-color:#b7e4c7}.fB{background:#d8f3dc;color:#1b4332;border-color:#d8f3dc}.fC{background:#d9ed92;color:#386641;border-color:#d9ed92}.fD{background:#fff3b0;color:#7b5e00;border-color:#fff3b0}.fE{background:#ffd6a5;color:#7a3500;border-color:#ffd6a5}.fF{background:#ffb3b3;color:#7a0000;border-color:#ffb3b3}.fG{background:#ff6b6b;color:#4a0000;border-color:#ff6b6b}
+    .filters{display:flex;gap:3px;flex-shrink:0}
+    .fb{padding:.32rem .58rem;border-radius:5px;font-size:.78rem;font-weight:700;cursor:pointer;border:2px solid transparent;transition:opacity .15s}
+    .fb.off{opacity:.28}
+    .fA{background:#b7e4c7;color:#1b4332}.fB{background:#d8f3dc;color:#1b4332}.fC{background:#d9ed92;color:#386641}
+    .fD{background:#fff3b0;color:#7b5e00}.fE{background:#ffd6a5;color:#7a3500}.fF{background:#ffb3b3;color:#7a0000}.fG{background:#ff6b6b;color:#4a0000}
 
-    /* Boutons */
-    .btn-ext{padding:.45rem 1rem;background:#4361ee;color:white;border:none;border-radius:7px;font-size:.85rem;font-weight:600;cursor:pointer;white-space:nowrap}
-    .btn-ext:hover{background:#3451d1}
-    .btn-ext:disabled{background:#2d3a5e;color:#5a7aaa;cursor:not-allowed}
-    .btn-csv{padding:.45rem 1rem;background:#1a6b3a;color:white;border:none;border-radius:7px;font-size:.85rem;font-weight:600;cursor:pointer;display:none}
+    .btn-x{padding:.4rem .9rem;background:#4361ee;color:white;border:none;border-radius:7px;font-size:.82rem;font-weight:600;cursor:pointer;white-space:nowrap}
+    .btn-x:hover{background:#3451d1} .btn-x:disabled{background:#2d3a5e;color:#5a7aaa;cursor:not-allowed}
+    .btn-csv{padding:.4rem .9rem;background:#1a6b3a;color:white;border:none;border-radius:7px;font-size:.82rem;font-weight:600;cursor:pointer;white-space:nowrap;display:none}
     .btn-csv:hover{background:#15552e}
-    #cnt{font-size:.8rem;color:#90a8cc;white-space:nowrap}
+    #cnt{font-size:.78rem;color:#90a8cc;white-space:nowrap;min-width:80px}
 
-    /* Statut */
-    .sbar{padding:.5rem 1rem;font-size:.82rem;text-align:center;display:none}
-    .sbar.ok{background:#1a3a2a;color:#4caf7d}
-    .sbar.err{background:#3a1a1a;color:#ff6b6b}
-    .sbar.load{background:#1a2a4a;color:#90b4ff}
+    .sbar{padding:.4rem 1rem;font-size:.8rem;text-align:center;display:none;flex-shrink:0}
+    .sbar.load{background:#1a2a4a;color:#90b4ff} .sbar.err{background:#3a1a1a;color:#ff6b6b} .sbar.ok{background:#1a3a2a;color:#4caf7d}
 
-    /* CARTE — SVG pur, pas de Leaflet */
-    #mapwrap{flex:1;position:relative;overflow:hidden;background:#0d1321;cursor:grab}
-    #mapwrap:active{cursor:grabbing}
-    #mapsvg{width:100%;height:100%;display:block}
+    #map{flex:1;min-height:0;z-index:1}
 
-    /* Tiles fond */
-    #tiles{pointer-events:none}
+    /* Leaflet styles inline */
+    .leaflet-container{background:#e8e0d8}
+    .leaflet-control-zoom a{background:#1e2a4a;color:#fff;border-color:#3d4f7e}
+    .leaflet-control-zoom a:hover{background:#3d4f7e}
 
-    /* Panneau latéral */
-    #panel{position:absolute;right:12px;top:12px;width:270px;background:#1e2a4a;border:1px solid #3d4f7e;border-radius:12px;padding:1rem;z-index:400;display:none;box-shadow:0 8px 32px rgba(0,0,0,.5);max-height:80vh;overflow-y:auto}
-    #panel h3{font-size:.9rem;font-weight:600;margin-bottom:.75rem;color:#cdd8f0}
-    .pr{display:flex;justify-content:space-between;font-size:.78rem;padding:4px 0;border-bottom:1px solid #2d3a5e}
-    .pr:last-child{border:none}
-    .pl{color:#8899bb}
-    .pv{font-weight:600;color:#cdd8f0;text-align:right;max-width:160px;word-break:break-word}
-    .close-btn{position:absolute;top:8px;right:10px;background:none;border:none;color:#8899bb;font-size:1.1rem;cursor:pointer}
-    .close-btn:hover{color:#fff}
-    .dbadge{display:inline-block;padding:1px 8px;border-radius:5px;font-weight:700}
+    /* Popup */
+    .dpe-popup .leaflet-popup-content-wrapper{background:#1e2a4a;color:#cdd8f0;border:1px solid #3d4f7e;border-radius:10px;box-shadow:0 8px 32px rgba(0,0,0,.5)}
+    .dpe-popup .leaflet-popup-tip{background:#1e2a4a}
+    .dpe-popup .leaflet-popup-content{margin:10px 14px;font-size:.8rem;line-height:1.6}
+    .popup-title{font-size:.88rem;font-weight:700;margin-bottom:6px;color:#fff}
+    .popup-row{display:flex;justify-content:space-between;gap:12px;padding:2px 0;border-bottom:1px solid #2d3a5e}
+    .popup-row:last-child{border:none}
+    .popup-lbl{color:#8899bb;white-space:nowrap}
+    .popup-val{font-weight:600;color:#cdd8f0;text-align:right}
+    .dbadge{display:inline-block;padding:0 7px;border-radius:4px;font-weight:700;font-size:.9rem}
 
-    /* Légende */
-    #legend{position:absolute;left:12px;bottom:12px;background:#1e2a4a;border:1px solid #3d4f7e;border-radius:8px;padding:.6rem .9rem;z-index:400;font-size:.75rem;color:#cdd8f0}
-    #legend .li{display:flex;align-items:center;gap:6px;margin-bottom:3px}
-    #legend .dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
-
-    /* Zoom controls */
-    .zoom-ctrl{position:absolute;right:12px;bottom:60px;z-index:400;display:flex;flex-direction:column;gap:3px}
-    .zoom-ctrl button{width:32px;height:32px;background:#1e2a4a;border:1px solid #3d4f7e;border-radius:6px;color:#fff;font-size:1.1rem;cursor:pointer;display:flex;align-items:center;justify-content:center}
-    .zoom-ctrl button:hover{background:#3d4f7e}
+    #legend{position:absolute;left:12px;bottom:30px;background:rgba(30,42,74,.92);border:1px solid #3d4f7e;border-radius:8px;padding:.5rem .8rem;z-index:500;font-size:.72rem;color:#cdd8f0;pointer-events:none}
+    #legend .li{display:flex;align-items:center;gap:5px;margin-bottom:2px}
+    #legend .dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;border:1.5px solid rgba(0,0,0,.3)}
   </style>
+  <!-- Leaflet CSS inline minimal -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
 </head>
 <body>
 
@@ -268,7 +263,7 @@ const HTML_EXTRACT = `<!DOCTYPE html>
     <input type="text" id="zi" placeholder="Ville ou adresse..." autocomplete="off"/>
     <div id="zs"></div>
   </div>
-  <div class="filters" id="filters">
+  <div class="filters">
     <button class="fb fA" data-c="A" onclick="tog(this)">A</button>
     <button class="fb fB" data-c="B" onclick="tog(this)">B</button>
     <button class="fb fC" data-c="C" onclick="tog(this)">C</button>
@@ -277,286 +272,117 @@ const HTML_EXTRACT = `<!DOCTYPE html>
     <button class="fb fF" data-c="F" onclick="tog(this)">F</button>
     <button class="fb fG" data-c="G" onclick="tog(this)">G</button>
   </div>
-  <button class="btn-ext" id="xbtn" onclick="doExtract()">🔍 Extraire zone</button>
+  <button class="btn-x" id="xbtn" onclick="doExtract()">🔍 Extraire zone</button>
   <button class="btn-csv" id="csvbtn" onclick="dlCSV()">⬇️ CSV</button>
   <span id="cnt"></span>
 </div>
-
 <div id="sbar" class="sbar"></div>
-
-<div id="mapwrap">
-  <canvas id="tileCanvas" style="position:absolute;top:0;left:0;pointer-events:none"></canvas>
-  <canvas id="dotCanvas" style="position:absolute;top:0;left:0;pointer-events:none"></canvas>
-  <div id="panel">
-    <button class="close-btn" onclick="document.getElementById('panel').style.display='none'">✕</button>
-    <h3 id="pa"></h3>
-    <div id="pb"></div>
-  </div>
-  <div id="legend">
-    <div class="li"><div class="dot" style="background:#b7e4c7"></div>A – Excellent</div>
-    <div class="li"><div class="dot" style="background:#d9ed92"></div>C – Bon</div>
-    <div class="li"><div class="dot" style="background:#fff3b0"></div>D – Moyen</div>
-    <div class="li"><div class="dot" style="background:#ffd6a5"></div>E – Médiocre</div>
-    <div class="li"><div class="dot" style="background:#ffb3b3"></div>F – Mauvais</div>
-    <div class="li"><div class="dot" style="background:#ff6b6b"></div>G – Passoire</div>
-  </div>
-  <div class="zoom-ctrl">
-    <button onclick="zoom(1)">+</button>
-    <button onclick="zoom(-1)">−</button>
-  </div>
+<div id="map"></div>
+<div id="legend">
+  <div class="li"><div class="dot" style="background:#b7e4c7"></div>A – Excellent</div>
+  <div class="li"><div class="dot" style="background:#d8f3dc"></div>B – Très bon</div>
+  <div class="li"><div class="dot" style="background:#d9ed92"></div>C – Bon</div>
+  <div class="li"><div class="dot" style="background:#fff3b0"></div>D – Moyen</div>
+  <div class="li"><div class="dot" style="background:#ffd6a5"></div>E – Médiocre</div>
+  <div class="li"><div class="dot" style="background:#ffb3b3"></div>F – Mauvais</div>
+  <div class="li"><div class="dot" style="background:#ff6b6b"></div>G – Passoire</div>
 </div>
 
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""><\/script>
 <script>
-// ── Projection Web Mercator ──────────────────────────────────────
 const DPE_COL={A:'#b7e4c7',B:'#d8f3dc',C:'#d9ed92',D:'#fff3b0',E:'#ffd6a5',F:'#ffb3b3',G:'#ff6b6b',N:'#aaa'};
 const DPE_BDR={A:'#1b4332',B:'#1b4332',C:'#386641',D:'#7b5e00',E:'#e07800',F:'#c0392b',G:'#7c0000',N:'#555'};
 
-let viewLat=43.450, viewLng=5.477, zoomLevel=14;
-let allPts=[];
-let active=new Set(['A','B','C','D','E','F','G']);
-let isDragging=false, dragStart={x:0,y:0}, dragOrigin={lat:0,lng:0};
-let tileCache={};
+// Carte Leaflet avec tuiles proxifiées par notre serveur
+const map = L.map('map', {zoomControl:true}).setView([43.450, 5.477], 14);
 
-const wrap=document.getElementById('mapwrap');
-const tCanvas=document.getElementById('tileCanvas');
-const dCanvas=document.getElementById('dotCanvas');
-const tCtx=tCanvas.getContext('2d');
-const dCtx=dCanvas.getContext('2d');
+L.tileLayer('/tile?z={z}&x={x}&y={y}', {
+  maxZoom: 19,
+  attribution: '© OpenStreetMap contributors'
+}).addTo(map);
 
-function resize(){
-  const w=wrap.clientWidth,h=wrap.clientHeight;
-  tCanvas.width=dCanvas.width=w;
-  tCanvas.height=dCanvas.height=h;
-  drawTiles();drawDots();
-}
-window.addEventListener('resize',resize);
-setTimeout(resize,50);
-
-// ── Conversion lat/lng <-> pixels ───────────────────────────────
-function tileXY(lat,lng,z){
-  const n=Math.pow(2,z);
-  const x=Math.floor((lng+180)/360*n);
-  const latR=lat*Math.PI/180;
-  const y=Math.floor((1-Math.log(Math.tan(latR)+1/Math.cos(latR))/Math.PI)/2*n);
-  return {x,y};
-}
-function latLngToPixel(lat,lng){
-  const W=tCanvas.width,H=tCanvas.height;
-  const n=Math.pow(2,zoomLevel);
-  const cx=(viewLng+180)/360*n;
-  const latR=viewLat*Math.PI/180;
-  const cy=(1-Math.log(Math.tan(latR)+1/Math.cos(latR))/Math.PI)/2*n;
-  const tileSize=256;
-  const px=(((lng+180)/360*n)-cx)*tileSize+W/2;
-  const latR2=lat*Math.PI/180;
-  const py=((1-Math.log(Math.tan(latR2)+1/Math.cos(latR2))/Math.PI)/2*n-cy)*tileSize+H/2;
-  return {x:px,y:py};
-}
-function pixelToLatLng(px,py){
-  const W=tCanvas.width,H=tCanvas.height;
-  const n=Math.pow(2,zoomLevel);
-  const tileSize=256;
-  const latR=viewLat*Math.PI/180;
-  const cy=(1-Math.log(Math.tan(latR)+1/Math.cos(latR))/Math.PI)/2*n;
-  const cx=(viewLng+180)/360*n;
-  const tx=(px-W/2)/tileSize+cx;
-  const ty=(py-H/2)/tileSize+cy;
-  const lng=tx/n*360-180;
-  const latR2=Math.atan(Math.sinh(Math.PI*(1-2*ty/n)));
-  const lat=latR2*180/Math.PI;
-  return {lat,lng};
-}
-
-// ── Tiles OSM ───────────────────────────────────────────────────
-function drawTiles(){
-  const W=tCanvas.width,H=tCanvas.height;
-  tCtx.fillStyle='#0d1321';
-  tCtx.fillRect(0,0,W,H);
-  const n=Math.pow(2,zoomLevel);
-  const tileSize=256;
-  const latR=viewLat*Math.PI/180;
-  const cy=(1-Math.log(Math.tan(latR)+1/Math.cos(latR))/Math.PI)/2*n;
-  const cx=(viewLng+180)/360*n;
-  const startX=Math.floor(cx-W/2/tileSize);
-  const startY=Math.floor(cy-H/2/tileSize);
-  const endX=Math.ceil(cx+W/2/tileSize);
-  const endY=Math.ceil(cy+H/2/tileSize);
-  for(let tx=startX;tx<=endX;tx++){
-    for(let ty=startY;ty<=endY;ty++){
-      const ttx=(tx%n+n)%n;
-      const tty=Math.max(0,Math.min(n-1,ty));
-      const key=zoomLevel+'/'+ttx+'/'+tty;
-      const px=(tx-cx)*tileSize+W/2;
-      const py=(ty-cy)*tileSize+H/2;
-      if(tileCache[key]&&tileCache[key].complete){
-        tCtx.drawImage(tileCache[key],px,py,tileSize,tileSize);
-      } else if(!tileCache[key]){
-        const img=new Image();
-        const sub=['a','b','c'][Math.abs(tx+ty)%3];
-        img.src='https://'+sub+'.tile.openstreetmap.org/'+zoomLevel+'/'+ttx+'/'+tty+'.png';
-        img.crossOrigin='anonymous';
-        img.onload=()=>{tileCache[key]=img;drawTiles();};
-        tileCache[key]=img;
-      }
-    }
-  }
-}
-
-// ── Points DPE ──────────────────────────────────────────────────
-function drawDots(){
-  const W=dCanvas.width,H=dCanvas.height;
-  dCtx.clearRect(0,0,W,H);
-  allPts.forEach(p=>{
-    if(!active.has(p.cl))return;
-    const {x,y}=latLngToPixel(p.lat,p.lng);
-    if(x<-10||x>W+10||y<-10||y>H+10)return;
-    dCtx.beginPath();
-    dCtx.arc(x,y,6,0,Math.PI*2);
-    dCtx.fillStyle=DPE_COL[p.cl]||'#aaa';
-    dCtx.fill();
-    dCtx.strokeStyle=DPE_BDR[p.cl]||'#555';
-    dCtx.lineWidth=1.5;
-    dCtx.stroke();
-  });
-}
-
-// ── Navigation carte ────────────────────────────────────────────
-wrap.addEventListener('mousedown',e=>{
-  if(e.target.closest('#panel')||e.target.closest('.zoom-ctrl'))return;
-  isDragging=true;
-  dragStart={x:e.clientX,y:e.clientY};
-  dragOrigin={lat:viewLat,lng:viewLng};
-});
-window.addEventListener('mousemove',e=>{
-  if(!isDragging)return;
-  const dx=e.clientX-dragStart.x, dy=e.clientY-dragStart.y;
-  const n=Math.pow(2,zoomLevel);
-  const tileSize=256;
-  const dLng=-(dx/tileSize/n)*360;
-  const latR=dragOrigin.lat*Math.PI/180;
-  const cy=(1-Math.log(Math.tan(latR)+1/Math.cos(latR))/Math.PI)/2*n;
-  const newCy=cy-dy/tileSize;
-  const newLatR=Math.atan(Math.sinh(Math.PI*(1-2*newCy/n)));
-  viewLat=Math.max(-85,Math.min(85,newLatR*180/Math.PI));
-  viewLng=dragOrigin.lng+dLng;
-  drawTiles();drawDots();
-});
-window.addEventListener('mouseup',()=>{isDragging=false;});
-wrap.addEventListener('wheel',e=>{
-  e.preventDefault();
-  const delta=e.deltaY>0?-1:1;
-  zoom(delta);
-},{passive:false});
-
-// Touch
-let lastTouch=null;
-wrap.addEventListener('touchstart',e=>{
-  if(e.touches.length===1){isDragging=true;dragStart={x:e.touches[0].clientX,y:e.touches[0].clientY};dragOrigin={lat:viewLat,lng:viewLng};}
-},{passive:true});
-wrap.addEventListener('touchmove',e=>{
-  if(!isDragging||e.touches.length!==1)return;
-  const dx=e.touches[0].clientX-dragStart.x, dy=e.touches[0].clientY-dragStart.y;
-  const n=Math.pow(2,zoomLevel);const tileSize=256;
-  const dLng=-(dx/tileSize/n)*360;
-  const latR=dragOrigin.lat*Math.PI/180;
-  const cy=(1-Math.log(Math.tan(latR)+1/Math.cos(latR))/Math.PI)/2*n;
-  const newCy=cy-dy/tileSize;
-  const newLatR=Math.atan(Math.sinh(Math.PI*(1-2*newCy/n)));
-  viewLat=Math.max(-85,Math.min(85,newLatR*180/Math.PI));
-  viewLng=dragOrigin.lng+dLng;
-  drawTiles();drawDots();
-},{passive:true});
-wrap.addEventListener('touchend',()=>{isDragging=false;});
-
-function zoom(delta){
-  zoomLevel=Math.max(10,Math.min(18,zoomLevel+delta));
-  tileCache={};drawTiles();drawDots();
-}
-
-// Click sur point
-dCanvas.addEventListener('click',e=>{
-  if(isDragging)return;
-  const rect=dCanvas.getBoundingClientRect();
-  const mx=e.clientX-rect.left, my=e.clientY-rect.top;
-  let best=null, bestD=100;
-  allPts.forEach(p=>{
-    if(!active.has(p.cl))return;
-    const {x,y}=latLngToPixel(p.lat,p.lng);
-    const d=Math.hypot(x-mx,y-my);
-    if(d<bestD){bestD=d;best=p;}
-  });
-  if(best)showPanel(best);
-  else document.getElementById('panel').style.display='none';
-});
-
-function showPanel(p){
-  const panel=document.getElementById('panel');
-  const cl=p.cl||'?';
-  const col=DPE_COL[cl]||'#eee';
-  document.getElementById('pa').textContent=p.adresse||'Adresse inconnue';
-  document.getElementById('pb').innerHTML=[
-    ['Classe DPE','<span class="dbadge" style="background:'+col+';color:'+DPE_BDR[cl]+'">'+cl+'</span>'],
-    ['Classe GES',p.ges||'N/A'],
-    ['Consommation',p.conso?Math.round(p.conso)+' kWh/m²/an':'N/A'],
-    ['Émissions CO₂',p.ges_val?Math.round(p.ges_val)+' kg/m²/an':'N/A'],
-    ['Énergie chauffage',p.energie||'N/A'],
-    ['Chauffage',p.chauffage||'N/A'],
-    ['Année construction',p.annee||'N/A'],
-    ['Type bâtiment',p.type||'N/A'],
-    ['Date DPE',p.date||'N/A'],
-    ['N° DPE',p.num||'N/A'],
-  ].map(([l,v])=>'<div class="pr"><span class="pl">'+l+'</span><span class="pv">'+v+'</span></div>').join('');
-  panel.style.display='block';
-}
-
-// ── Suggestions adresse ─────────────────────────────────────────
+let markerLayer = L.layerGroup().addTo(map);
+let allPts = [];
+let active = new Set(['A','B','C','D','E','F','G']);
 let debSug;
+
+// Recherche adresse
 const zi=document.getElementById('zi'), zs=document.getElementById('zs');
 zi.addEventListener('input',()=>{
   clearTimeout(debSug);
   const q=zi.value.trim();
   if(q.length<3){zs.style.display='none';return;}
   debSug=setTimeout(async()=>{
-    try{const r=await fetch('/ban?q='+encodeURIComponent(q));const d=await r.json();
-    if(!d.features?.length){zs.style.display='none';return;}
-    zs.innerHTML=d.features.map(f=>'<div class="zsi" data-lat="'+f.geometry.coordinates[1]+'" data-lng="'+f.geometry.coordinates[0]+'" onclick="goTo(this)">'+f.properties.label+'</div>').join('');
-    zs.style.display='block';}catch{zs.style.display='none';}
+    try{
+      const r=await fetch('/ban?q='+encodeURIComponent(q));
+      const d=await r.json();
+      if(!d.features?.length){zs.style.display='none';return;}
+      zs.innerHTML=d.features.map(f=>'<div class="zsi" data-lat="'+f.geometry.coordinates[1]+'" data-lng="'+f.geometry.coordinates[0]+'" onclick="goTo(this)">'+f.properties.label+'</div>').join('');
+      zs.style.display='block';
+    }catch{zs.style.display='none';}
   },280);
 });
 zi.addEventListener('keydown',e=>{if(e.key==='Enter'){zs.style.display='none';doExtract();}});
 document.addEventListener('click',e=>{if(!e.target.closest('.swrap'))zs.style.display='none';});
+
 function goTo(el){
-  viewLat=parseFloat(el.dataset.lat); viewLng=parseFloat(el.dataset.lng);
-  zoomLevel=15; tileCache={};
+  map.setView([parseFloat(el.dataset.lat),parseFloat(el.dataset.lng)],15);
   zs.style.display='none';
-  drawTiles();drawDots();
-  setTimeout(doExtract,300);
+  setTimeout(doExtract,400);
 }
 
-// ── Filtres ─────────────────────────────────────────────────────
 function tog(btn){
   const c=btn.dataset.c;
   if(active.has(c)){active.delete(c);btn.classList.add('off');}
   else{active.add(c);btn.classList.remove('off');}
-  drawDots();
+  refreshMarkers();
 }
 
-// ── Status ──────────────────────────────────────────────────────
 function st(msg,type){
   const b=document.getElementById('sbar');
   b.textContent=msg; b.className='sbar '+type; b.style.display=msg?'block':'none';
 }
 
-// ── EXTRACTION ──────────────────────────────────────────────────
+function makeIcon(cl){
+  const col=DPE_COL[cl]||'#aaa', bdr=DPE_BDR[cl]||'#555';
+  return L.divIcon({
+    html:'<div style="width:13px;height:13px;border-radius:50%;background:'+col+';border:2px solid '+bdr+';box-shadow:0 1px 4px rgba(0,0,0,.4)"></div>',
+    iconSize:[13,13], iconAnchor:[6,6], className:''
+  });
+}
+
+function makePopup(p){
+  const cl=p.cl||'?', col=DPE_COL[cl]||'#eee', bdr=DPE_BDR[cl]||'#555';
+  return '<div class="popup-title">📍 '+p.adresse+'</div>'+[
+    ['Classe DPE','<span class="dbadge" style="background:'+col+';color:'+bdr+'">'+cl+'</span>'],
+    ['Classe GES',p.ges||'N/A'],
+    ['Consommation',p.conso?Math.round(p.conso)+' kWh/m²/an':'N/A'],
+    ['Émissions CO₂',p.gesv?Math.round(p.gesv)+' kg/m²/an':'N/A'],
+    ['Énergie chauffage',p.energie||'N/A'],
+    ['Année construction',p.annee||'N/A'],
+    ['Type bâtiment',p.type||'N/A'],
+    ['Date DPE',p.date||'N/A'],
+    ['N° DPE',p.num||'N/A'],
+  ].map(([l,v])=>'<div class="popup-row"><span class="popup-lbl">'+l+'</span><span class="popup-val">'+v+'</span></div>').join('');
+}
+
+function refreshMarkers(){
+  markerLayer.clearLayers();
+  allPts.forEach(p=>{
+    if(!active.has(p.cl))return;
+    const m=L.marker([p.lat,p.lng],{icon:makeIcon(p.cl)});
+    m.bindPopup(makePopup(p),{className:'dpe-popup',maxWidth:260});
+    markerLayer.addLayer(m);
+  });
+}
+
 async function doExtract(){
   if(!active.size){st('Sélectionnez au moins une classe','err');return;}
-  const W=tCanvas.width,H=tCanvas.height;
-  const tl=pixelToLatLng(0,0), br=pixelToLatLng(W,H);
-  const bbox=tl.lng+','+br.lat+','+br.lng+','+tl.lat;
+  const b=map.getBounds();
+  const bbox=b.getWest()+','+b.getSouth()+','+b.getEast()+','+b.getNorth();
   const classes=[...active].join(',');
   document.getElementById('xbtn').disabled=true;
   st('Extraction en cours...','load');
-  document.getElementById('cnt').textContent='';
   document.getElementById('csvbtn').style.display='none';
   try{
     const r=await fetch('/api/extract?bbox='+encodeURIComponent(bbox)+'&classes='+encodeURIComponent(classes));
@@ -564,52 +390,49 @@ async function doExtract(){
     document.getElementById('xbtn').disabled=false;
     if(data.error){st('Erreur: '+data.error,'err');return;}
     const rows=data.results||[];
-
-    // Conserver les anciens points hors zone + ajouter nouveaux
-    const newPts=rows.map(row=>({
-      lat:parseFloat(row.latitude_ban||row.latitude||0),
-      lng:parseFloat(row.longitude_ban||row.longitude||0),
-      cl:row.etiquette_dpe||'N',
-      adresse:row.adresse_ban||row.geo_adresse||'?',
-      ges:row.etiquette_ges||'',
-      conso:row.conso_5_usages_e_finale||row.consommation_energie||0,
-      ges_val:row.emission_ges_5_usages||row.estimation_ges||0,
-      energie:row.type_energie_principale_chauffage||'',
-      chauffage:row.type_installation_chauffage||'',
-      annee:row.annee_construction||'',
-      type:row.type_batiment||'',
-      date:(row.date_etablissement_dpe||'').substring(0,10),
-      num:row.numero_dpe||'',
-      raw:row
-    })).filter(p=>p.lat&&p.lng);
-
-    // Dédupliquer par numéro DPE
+    // Dédupliquer
     const seen=new Set(allPts.map(p=>p.num));
-    newPts.forEach(p=>{if(!seen.has(p.num)){allPts.push(p);seen.add(p.num);}});
-
+    rows.forEach(row=>{
+      const lat=parseFloat(row.latitude_ban||0), lng=parseFloat(row.longitude_ban||0);
+      if(!lat||!lng)return;
+      const num=row.numero_dpe||'';
+      if(seen.has(num))return;
+      seen.add(num);
+      allPts.push({
+        lat,lng,
+        cl:row.etiquette_dpe||'N',
+        adresse:row.adresse_ban||'?',
+        ges:row.etiquette_ges||'',
+        conso:row.conso_5_usages_e_finale||0,
+        gesv:row.emission_ges_5_usages||0,
+        energie:row.type_energie_principale_chauffage||'',
+        chauffage:row.type_installation_chauffage||'',
+        annee:row.annee_construction||'',
+        type:row.type_batiment||'',
+        date:(row.date_etablissement_dpe||'').substring(0,10),
+        num
+      });
+    });
+    refreshMarkers();
     const total=data.total||rows.length;
-    st(!rows.length?'Aucun DPE dans cette zone. Déplacez ou dézoomez.':'','ok');
+    st(!rows.length?'Aucun DPE dans cette zone visible.':'','ok');
     if(rows.length) st('','ok');
     document.getElementById('cnt').textContent=allPts.length+' DPE'+(total>rows.length?' ('+total+' total)':'');
-    document.getElementById('csvbtn').style.display=allPts.length?'inline-block':'none';
-    drawDots();
+    if(allPts.length) document.getElementById('csvbtn').style.display='inline-block';
   }catch(e){
     document.getElementById('xbtn').disabled=false;
     st('Erreur: '+e.message,'err');
   }
 }
 
-// ── Export CSV ──────────────────────────────────────────────────
 function dlCSV(){
   if(!allPts.length)return;
-  const cols=['adresse','cl','ges','conso','ges_val','energie','chauffage','annee','type','date','num','lat','lng'];
-  const labels=['Adresse','Classe DPE','Classe GES','Conso kWh/m²/an','Émissions kg/m²/an','Énergie chauffage','Type chauffage','Année construction','Type bâtiment','Date DPE','N° DPE','Latitude','Longitude'];
-  const csv=[labels.join(';'),...allPts.filter(p=>active.has(p.cl)).map(p=>cols.map(k=>JSON.stringify(p[k]??'')).join(';'))].join('\n');
+  const cols=['adresse','cl','ges','conso','gesv','energie','chauffage','annee','type','date','num','lat','lng'];
+  const labels=['Adresse','Classe DPE','Classe GES','Conso kWh/m2/an','Emissions kg/m2/an','Energie chauffage','Type chauffage','Annee construction','Type batiment','Date DPE','N DPE','Latitude','Longitude'];
+  const pts=allPts.filter(p=>active.has(p.cl));
+  const csv=[labels.join(';'),...pts.map(p=>cols.map(k=>JSON.stringify(p[k]??'')).join(';'))].join('\n');
   const blob=new Blob(['\uFEFF'+csv],{type:'text/csv;charset=utf-8'});
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='dpe_extraction.csv';a.click();
 }
-
-// Init
-drawTiles();
 <\/script>
 </body></html>`;
